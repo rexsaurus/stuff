@@ -16,7 +16,7 @@
  */
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { Pool } from 'pg'
 
 const DEFAULT_DB =
@@ -293,20 +293,51 @@ function buildPhotoUrl(
   manifestUrl: string,
 ): string {
   const b = imageBaseUrl?.trim()
-  if (b) return `${b.replace(/\/$/, '')}/${personId}/photo_${photoNum}.jpg`
+  if (b) {
+    const base = b.replace(/\/$/, '')
+    return `${base}/${personId}/photo_${photoNum}.jpg`
+  }
   return manifestUrl
+}
+
+/** Prefer `MANIFEST_PATH`, then `./scripts/manifest.json`, then `./manifest.json` (e.g. rexsaurus/stuff layout). */
+function resolveManifestPath(): string {
+  const envRel = process.env.MANIFEST_PATH?.trim()
+  if (envRel) return isAbsolute(envRel) ? envRel : join(process.cwd(), envRel)
+  const candidates = ['scripts/manifest.json', 'manifest.json']
+  for (const rel of candidates) {
+    const full = join(process.cwd(), rel)
+    if (existsSync(full)) return full
+  }
+  return join(process.cwd(), 'scripts/manifest.json')
+}
+
+const WEEKDAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'] as const
+
+function pickAvailableDays(): string[] {
+  const picked = WEEKDAYS.filter(() => randBool(52))
+  if (picked.length >= 2) return [...picked]
+  return ['Friday', 'Saturday', 'Sunday']
+}
+
+function pickAvailableTimes(): string[] {
+  const pool = ['09:00-12:00', '12:00-16:00', '16:00-20:00', '20:00-23:00', 'By arrangement']
+  const picked = pool.filter(() => randBool(48))
+  return picked.length ? picked : ['12:00-20:00']
 }
 
 async function main(): Promise<void> {
   loadScriptEnv()
   const databaseUrl = resolveDatabaseUrl()
 
-  const manifestPath = join(
-    process.cwd(),
-    (process.env.MANIFEST_PATH || './scripts/manifest.json').trim(),
-  )
+  const manifestPath = resolveManifestPath()
 
   const imageBase = process.env.IMAGE_BASE_URL?.trim()
+  if (imageBase) {
+    console.log(`[seed] IMAGE_BASE_URL → photo URLs like ${imageBase.replace(/\/$/, '')}/<person_id>/photo_<n>.jpg`)
+  } else {
+    console.warn('[seed] IMAGE_BASE_URL unset — using manifest `url` values for photos.')
+  }
 
   const pool = new Pool({ connectionString: databaseUrl })
   const cdb = await pool.query<{ current_database: string }>(
@@ -353,7 +384,7 @@ async function main(): Promise<void> {
       const phone = `+1555000${100 + index}`
 
       const photoUrls: string[] = []
-      const galleryPhotos = person.photos.map((ph, j) => {
+      const galleryPhotos = (person.photos ?? []).map((ph, j) => {
         const num = typeof ph.photo_num === 'number' ? ph.photo_num : j + 1
         const public_url = buildPhotoUrl(imageBase, person.person_id, num, ph.url)
         photoUrls.push(public_url)
@@ -370,10 +401,37 @@ async function main(): Promise<void> {
 
       const primaryPhoto = photoUrls[0] ?? ''
 
+      const firstName = person.name.split(/\s+/)[0] ?? person.name
+      const bioText = fakeProviderBio(firstName, city.city)
+      const hourly = randInt(180, 520)
+      const bodyType = rand(BODY_TYPES)
+      const bustSize = rand(BUST_SIZES)
+      const heightLabel = rand(HEIGHT_POOL)
+      const eyeColour = rand(EYE_COLOURS)
+      const servicesList = Array.from(new Set([rand(SERVICES), rand(SERVICES), rand(SERVICES)]))
+      const availableToday = randBool(35)
+      const shortNotice = randBool(42)
+      const byAppointment = availableToday ? randBool(55) : true
+      const availableDays = pickAvailableDays()
+      const availableTimes = pickAvailableTimes()
+      const ratingScore = Math.round((42 + Math.random() * 8) * 10) / 10
+      const reviewCount = randInt(3, 52)
+
+      const rates = {
+        '1hour': hourly,
+        '2hours': Math.max(hourly * 2 - randInt(20, 80), hourly + 40),
+        '3hours': Math.round(hourly * 2.75),
+        overnight: hourly * randInt(4, 7),
+      }
+
       const rawData: Record<string, unknown> = {
         id: listingId,
         display_name: person.name,
         displayName: person.name,
+        bio: bioText,
+        description: bioText,
+        city: city.city,
+        state: city.state,
         lat: city.lat,
         lng: city.lng,
         place_id: city.placeId,
@@ -381,13 +439,15 @@ async function main(): Promise<void> {
         place_name: city.city,
         placeName: city.city,
         phone,
-        service: rand(SERVICES),
-        tags: `${parseHairColour(hairStr)} ${rand(BODY_TYPES)}`,
-        description: fakeProviderBio(person.name.split(/\s+/)[0] ?? person.name, city.city),
-        ...(() => {
-          const h = randInt(180, 520)
-          return { hourly_rate: h, hourlyRate: h }
-        })(),
+        photos: photoUrls,
+        cover_photo: primaryPhoto,
+        coverPhoto: primaryPhoto,
+        service: servicesList[0],
+        services: servicesList,
+        tags: `${parseHairColour(hairStr)} ${bodyType}`,
+        hourly_rate: hourly,
+        hourlyRate: hourly,
+        rates,
         gender: 'Female',
         ethnicity: parseSkinToEthnicity(skinStr),
         hair_color: parseHairColour(hairStr),
@@ -395,13 +455,13 @@ async function main(): Promise<void> {
         hair_length: parseHairLength(hairStr),
         hairLength: parseHairLength(hairStr),
         age: ageNum,
-        body_type: rand(BODY_TYPES),
-        bodyType: rand(BODY_TYPES),
-        bust_size: rand(BUST_SIZES),
-        bustSize: rand(BUST_SIZES),
-        height: rand(HEIGHT_POOL),
-        eye_colour: rand(EYE_COLOURS),
-        eyeColour: rand(EYE_COLOURS),
+        body_type: bodyType,
+        bodyType,
+        bust_size: bustSize,
+        bustSize,
+        height: heightLabel,
+        eye_colour: eyeColour,
+        eyeColour,
         photo_url: primaryPhoto,
         photoUrl: primaryPhoto,
         photo_data_uris: photoUrls,
@@ -409,20 +469,30 @@ async function main(): Promise<void> {
         gallery_photos: galleryPhotos,
         galleryPhotos,
         reviews: [],
-        rating: 0,
-        review_count: 0,
-        reviewCount: 0,
-        available: randBool(35),
+        rating: ratingScore,
+        rating_score: ratingScore,
+        overall_rating: ratingScore,
+        overallRating: ratingScore,
+        review_count: reviewCount,
+        reviewCount,
+        available: availableToday,
+        available_today: availableToday,
+        availableToday,
+        short_notice: shortNotice,
+        shortNotice,
+        by_appointment: byAppointment,
+        byAppointment,
+        available_days: availableDays,
+        availableDays,
+        available_times: availableTimes,
+        availableTimes,
         is_seeded: true,
         seed_version: '1.0',
         seed_person_id: person.person_id,
         seeded_at: seededAt,
       }
 
-      await client.query(`INSERT INTO provider_listings (id, raw_data) VALUES ($1, $2::jsonb)`, [
-        listingId,
-        JSON.stringify(rawData),
-      ])
+      await client.query(`INSERT INTO provider_listings (id, raw_data) VALUES ($1, $2::jsonb)`, [listingId, rawData])
 
       await client.query(
         `INSERT INTO auth_accounts (
@@ -447,9 +517,9 @@ async function main(): Promise<void> {
           parseSkinToEthnicity(skinStr),
           parseHairColour(hairStr),
           parseHairLength(hairStr),
-          rawData.height as string,
-          rawData.body_type as string,
-          rawData.bust_size as string,
+          heightLabel,
+          bodyType,
+          bustSize,
         ],
       )
     }
